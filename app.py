@@ -28,6 +28,7 @@ _w = WorkspaceClient()
 
 TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
+NEWS_TABLE_NAME = os.environ.get("NEWS_TABLE_NAME", "ticker_news")
 
 # Basic stock ticker shape check: 1-10 uppercase letters, with an optional
 # ".X" or ".XX" share-class suffix (e.g. "BRK.B"). This rejects obviously
@@ -57,6 +58,21 @@ def ensure_watchlist_table():
             email TEXT NOT NULL,
             latest_price NUMERIC,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (symbol, email)
+        )
+        """
+    )
+
+
+def ensure_news_table():
+    """Create the ticker news table in Lakebase if it doesn't exist yet."""
+    lakebase.run_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {NEWS_TABLE_NAME} (
+            symbol TEXT NOT NULL,
+            email TEXT NOT NULL,
+            news_data JSONB NOT NULL,
+            fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (symbol, email)
         )
         """
@@ -195,6 +211,92 @@ def add_to_watchlist():
     )
 
     return jsonify({"symbol": symbol, "email": email, "latest_price": price})
+
+
+@app.route("/watchlist/<symbol>", methods=["DELETE"])
+def delete_from_watchlist(symbol: str):
+    """
+    Remove a symbol from the current user's watchlist.
+    """
+    ensure_watchlist_table()
+    
+    symbol = symbol.strip().upper() if isinstance(symbol, str) else ""
+    if not symbol or not _TICKER_RE.match(symbol):
+        return jsonify({"error": f"Invalid ticker symbol: {symbol!r}"}), 400
+    
+    email = _current_user_email()
+    
+    lakebase.run_write(
+        f"DELETE FROM {WATCHLIST_TABLE_NAME} WHERE symbol = %s AND email = %s",
+        (symbol, email),
+    )
+    
+    return jsonify({"symbol": symbol, "deleted": True})
+
+
+@app.route("/news/<symbol>", methods=["GET"])
+def get_ticker_news(symbol: str):
+    """
+    Fetch news for a ticker symbol from the Massive API and store it in Lakebase.
+    Returns the cached news if fetched recently (within last hour), otherwise
+    fetches fresh news from the API.
+    """
+    ensure_news_table()
+    
+    symbol = symbol.strip().upper() if isinstance(symbol, str) else ""
+    if not symbol or not _TICKER_RE.match(symbol):
+        return jsonify({"error": f"Invalid ticker symbol: {symbol!r}"}), 400
+    
+    email = _current_user_email()
+    
+    # Check if we have recent news (within last hour)
+    rows = lakebase.run_query(
+        f"""
+        SELECT news_data, fetched_at 
+        FROM {NEWS_TABLE_NAME}
+        WHERE symbol = %s AND email = %s
+        AND fetched_at > now() - interval '1 hour'
+        ORDER BY fetched_at DESC
+        LIMIT 1
+        """,
+        (symbol, email),
+    )
+    
+    if rows:
+        # Return cached news
+        return jsonify({
+            "symbol": symbol,
+            "news": rows[0]["news_data"],
+            "cached": True,
+            "fetched_at": str(rows[0]["fetched_at"])
+        })
+    
+    # Fetch fresh news from Massive API
+    client = MassiveClient()
+    try:
+        news_data = client.get_ticker_news(symbol, limit=10)
+    except requests.HTTPError as e:
+        return jsonify({"error": f"Failed to fetch news for {symbol}: {str(e)}"}), 400
+    
+    # Store news in Lakebase
+    import json as _json
+    lakebase.run_write(
+        f"""
+        INSERT INTO {NEWS_TABLE_NAME} (symbol, email, news_data, fetched_at)
+        VALUES (%s, %s, %s, now())
+        ON CONFLICT (symbol, email) DO UPDATE
+            SET news_data = EXCLUDED.news_data,
+                fetched_at = EXCLUDED.fetched_at
+        """,
+        (symbol, email, _json.dumps(news_data)),
+    )
+    
+    return jsonify({
+        "symbol": symbol,
+        "news": news_data,
+        "cached": False,
+        "fetched_at": "now"
+    })
 
 
 def _extract_latest_price(data: dict) -> float | None:
